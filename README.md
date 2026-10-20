@@ -9,8 +9,8 @@ disk cache.
 Requires Go 1.26 or newer. From PowerShell:
 
 ```powershell
-Copy-Item .\config.example.yaml .\config.yaml
 # Edit config.yaml to define the packages available in your feed.
+# For local-only access outside Docker, set listen to "127.0.0.1:8080".
 go run .\cmd\nuget-proxy -config .\config.yaml
 ```
 
@@ -115,19 +115,10 @@ converted into empty successful feeds.
 
 ## Configuration and cache
 
-See [`config.example.yaml`](config.example.yaml) for the complete configuration.
-
-| Setting | Default / requirement |
-| --- | --- |
-| `listen` | `127.0.0.1:8080`; use `0.0.0.0:8080` when running in a container. |
-| `public_base_url` | Required absolute HTTP(S) URL; may include a path prefix, such as `https://packages.example.com/nuget`. Does not include `/v3/index.json`. |
-| `allow` | Empty; exact IDs or terminal-wildcard prefixes. |
-| `cache.dir` | `.cache`, relative to the process working directory. Use a dedicated, writable, persistent directory. |
-| `cache.max_bytes` | 1 GiB, counting cache-file bytes and in-flight reservations. |
-| `cache.max_object_bytes` | 128 MiB. `max_bytes` must leave at least 64 KiB extra for metadata. |
-| `cache.metadata_ttl` | `5m`; refresh interval for discovery, version lists, audit data, and signing indexes. |
-| `upstream.timeout` | `2m`, including concurrency waits and downloading each cached object. |
-| `upstream.max_concurrent` | `8`, including response-body downloads. |
+[`config.yaml`](config.yaml) is the single configuration file for native runs
+and Docker, with each setting documented inline. The provided allowlist is empty;
+configure approved IDs or prefixes before consuming packages. It binds all
+interfaces for Docker; use `127.0.0.1:8080` for local-only native access.
 
 Downloads stream to temporary files, then become visible only after a complete
 transfer. **The first response waits for the object to be fully cached** before
@@ -169,12 +160,31 @@ from local HTTP feeds; package bytes are unchanged in either mode.
 - Interrupt/termination signals initiate graceful shutdown with a 30-second
   deadline.
 
-For the container, set `listen: "0.0.0.0:8080"` and `cache.dir: "/data"` in a
-configuration file, with your external `public_base_url`. The image runs as a
-non-root user; bind-mounted cache directories must be writable by UID 65532.
+The image includes [`config.yaml`](config.yaml) at
+`/config/config.yaml`, so no configuration mount is required to start it.
+The included configuration listens on `0.0.0.0:8080` and advertises
+`http://localhost:8080`. The container's working directory is `/data`, so the
+relative cache directory `.cache` resolves to `/data/.cache`, inside the
+persistent volume. To reuse an existing cache stored directly in `/data`,
+retain `cache.dir: "/data"`.
+
+No cache data is generated during the build. The final `scratch` stage creates
+`/config` when copying the configuration and `/data` with `WORKDIR`, after
+selecting UID/GID 65532. This uses BuildKit's working-directory ownership handling
+without requiring a shell or copying an empty directory from the build stage.
 
 ```powershell
 docker build -t nuget-proxy .
+docker run --rm -p 8080:8080 `
+  --mount "type=volume,source=nuget-proxy-cache,target=/data" `
+  nuget-proxy
+```
+
+Set `allow` and your external `public_base_url` in `config.yaml` before building,
+or override the included file with a read-only bind mount. The image runs as a non-root user;
+bind-mounted cache directories must be writable by UID 65532.
+
+```powershell
 docker run --rm -p 8080:8080 `
   --mount "type=bind,source=$((Get-Item .\config.yaml).FullName),target=/config/config.yaml,readonly" `
   --mount "type=volume,source=nuget-proxy-cache,target=/data" `

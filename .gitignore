@@ -28,8 +28,7 @@ go.work.sum
 # env file
 .env
 
-# Local proxy configuration and cached package content
-config.yaml
+# Cached package content
 .cache/
 
 # Editor/IDE

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -69,5 +70,11 @@ func TestEmptyAllowlistIsValid(t *testing.T) {
 	cfg, err := Decode(strings.NewReader("public_base_url: http://localhost:8080\nallow: []"))
 	if err != nil || len(cfg.Allow) != 0 {
 		t.Fatalf("empty subset configuration: %+v, %v", cfg, err)
+	}
+}
+
+func TestConfigurationFile(t *testing.T) {
+	if _, err := Load(filepath.Join("..", "..", "config.yaml")); err != nil {
+		t.Fatal(err)
 	}
 }
