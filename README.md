@@ -73,8 +73,9 @@ upstream, for version lists, manifests, and downloads. **Subset exclusions never
 return `403`.** Rules run before both cache and upstream access, including for
 previously cached packages.
 
-Configuration changes require a restart. Unknown fields, malformed rules,
-invalid URLs/limits, and multiple YAML documents fail startup explicitly.
+Configuration changes, including environment overrides, require a restart.
+Unknown YAML fields, malformed rules, invalid URLs/limits, and multiple YAML
+documents fail startup explicitly.
 
 ## Architecture and protocol
 
@@ -119,6 +120,48 @@ converted into empty successful feeds.
 and Docker, with each setting documented inline. The provided allowlist is empty;
 configure approved IDs or prefixes before consuming packages. It binds all
 interfaces for Docker; use `127.0.0.1:8080` for local-only native access.
+
+### Environment overrides
+
+Every setting can be overridden at startup with a `NUGET_PROXY_*` environment
+variable. Precedence is **built-in defaults < YAML < environment**, with
+validation applied to the merged configuration. The YAML file must still exist
+and parse successfully; environment overrides can supply otherwise missing
+required settings, but do not hide malformed YAML or unknown fields.
+
+| Configuration setting | Environment variable | Format |
+| --- | --- | --- |
+| `listen` | `NUGET_PROXY_LISTEN` | Address and port, such as `0.0.0.0:8080` |
+| `public_base_url` | `NUGET_PROXY_PUBLIC_BASE_URL` | Absolute HTTP(S) URL |
+| `allow` | `NUGET_PROXY_ALLOW` | Comma-separated IDs or prefixes |
+| `cache.dir` | `NUGET_PROXY_CACHE_DIR` | Directory path |
+| `cache.max_bytes` | `NUGET_PROXY_CACHE_MAX_BYTES` | Base-10 byte count |
+| `cache.max_object_bytes` | `NUGET_PROXY_CACHE_MAX_OBJECT_BYTES` | Base-10 byte count |
+| `cache.metadata_ttl` | `NUGET_PROXY_CACHE_METADATA_TTL` | Go duration, such as `5m` |
+| `upstream.timeout` | `NUGET_PROXY_UPSTREAM_TIMEOUT` | Go duration, such as `2m` |
+| `upstream.max_concurrent` | `NUGET_PROXY_UPSTREAM_MAX_CONCURRENT` | Positive base-10 integer |
+
+Unset variables preserve the YAML/default values. Set variables override them
+even when empty; invalid overrides stop startup with an error naming the
+corresponding variable. Size and duration limits retain their normal validation
+rules; byte counts do not accept suffixes such as `MiB`.
+
+`NUGET_PROXY_ALLOW` **replaces**, rather than appends to, the YAML allowlist.
+Whitespace around comma-separated patterns is trimmed. An explicitly empty value
+clears the list, making all packages unavailable; whitespace-only values and
+empty entries such as `Ddth.*,` are invalid. The value is not a JSON/YAML array.
+
+```powershell
+$env:NUGET_PROXY_PUBLIC_BASE_URL = "http://localhost:8080"
+$env:NUGET_PROXY_ALLOW = "Newtonsoft.Json,Ddth.*"
+$env:NUGET_PROXY_CACHE_METADATA_TTL = "10m"
+go run .\cmd\nuget-proxy -config .\config.yaml
+```
+
+To return to the YAML value, unset the variable, for example with
+`Remove-Item Env:\NUGET_PROXY_ALLOW` in PowerShell.
+
+### Disk cache
 
 Downloads stream to temporary files, then become visible only after a complete
 transfer. **The first response waits for the object to be fully cached** before
@@ -176,13 +219,18 @@ without requiring a shell or copying an empty directory from the build stage.
 ```powershell
 docker build -t nuget-proxy .
 docker run --rm -p 8080:8080 `
+  --env "NUGET_PROXY_ALLOW=Newtonsoft.Json,Ddth.*" `
+  --env "NUGET_PROXY_PUBLIC_BASE_URL=http://localhost:8080" `
   --mount "type=volume,source=nuget-proxy-cache,target=/data" `
   nuget-proxy
 ```
 
-Set `allow` and your external `public_base_url` in `config.yaml` before building,
-or override the included file with a read-only bind mount. The image runs as a non-root user;
-bind-mounted cache directories must be writable by UID 65532.
+The `--env` flags override the included configuration without rebuilding or
+mounting a file. Set `NUGET_PROXY_PUBLIC_BASE_URL` to your externally reachable
+URL for shared deployments. Alternatively, edit `config.yaml` before building
+or override it with a read-only bind mount. Environment variables take precedence
+over a mounted configuration too. The image runs as a non-root user; bind-mounted
+cache directories must be writable by UID 65532.
 
 ```powershell
 docker run --rm -p 8080:8080 `

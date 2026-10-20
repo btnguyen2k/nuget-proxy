@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,7 +75,12 @@ func TestEmptyAllowlistIsValid(t *testing.T) {
 }
 
 func TestConfigurationFile(t *testing.T) {
-	if _, err := Load(filepath.Join("..", "..", "config.yaml")); err != nil {
+	file, err := os.Open(filepath.Join("..", "..", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := Decode(file); err != nil {
 		t.Fatal(err)
 	}
 }
