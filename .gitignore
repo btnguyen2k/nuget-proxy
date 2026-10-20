@@ -28,6 +28,10 @@ go.work.sum
 # env file
 .env
 
+# Local proxy configuration and cached package content
+config.yaml
+.cache/
+
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
