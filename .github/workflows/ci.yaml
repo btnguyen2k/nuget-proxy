@@ -27,7 +27,7 @@ jobs:
   # Check out the event SHA (synthetic merge on PRs), or an explicit target-sha.
   # Standalone PR previews use base history/metadata, not the proposed PR changes.
   # A caller's full 40-character SHA overrides both checkout and preview targets.
-  pin:
+  PinCommitSHA:
     runs-on: ubuntu-latest
     outputs:
       target-sha: ${{ steps.capture.outputs.target-sha }}
@@ -55,8 +55,8 @@ jobs:
           printf 'action-target-sha=%s\n' "$ACTION_TARGET_SHA" >> "$GITHUB_OUTPUT"
           printf 'action-branch=%s\n' "$ACTION_BRANCH" >> "$GITHUB_OUTPUT"
 
-  ci:
-    needs: pin
+  BuildAndTest:
+    needs: PinCommitSHA
     runs-on: ubuntu-latest
     outputs:
       result: ${{ steps.plan.outputs.result }}
@@ -64,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.pin.outputs.target-sha }}
+          ref: ${{ needs.PinCommitSHA.outputs.target-sha }}
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -77,5 +77,5 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           dry-run: true
-          target-sha: ${{ needs.pin.outputs.action-target-sha }}
-          branches: ${{ needs.pin.outputs.action-branch }}
+          target-sha: ${{ needs.PinCommitSHA.outputs.action-target-sha }}
+          branches: ${{ needs.PinCommitSHA.outputs.action-branch }}
