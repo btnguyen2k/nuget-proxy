@@ -1,5 +1,8 @@
 name: 'ci'
 
+env:
+  VERSION_PREFIX: v
+
 on:
   push:
     branches: ['**']
@@ -43,12 +46,12 @@ jobs:
           ACTION_BRANCH: ${{ github.base_ref || github.ref_name }}
         run: |
           if [[ ! "$TARGET_SHA" =~ ^[[:xdigit:]]{40}$ ]]; then
-            echo "::error::target-sha must be a full 40-character commit SHA"
+            echo "❌target-sha must be a full 40-character commit SHA"
             exit 1
           fi
           ACTION_TARGET_SHA="${PR_BASE_SHA:-$TARGET_SHA}"
           if [[ ! "$ACTION_TARGET_SHA" =~ ^[[:xdigit:]]{40}$ ]]; then
-            echo "::error::Action target must be a full 40-character commit SHA"
+            echo "❌Action target must be a full 40-character commit SHA"
             exit 1
           fi
           printf 'target-sha=%s\n' "$TARGET_SHA" >> "$GITHUB_OUTPUT"
@@ -77,6 +80,7 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           dry-run: true
+          tag-prefix: ${{ env.VERSION_PREFIX }}
           target-sha: ${{ needs.PinCommitSHA.outputs.action-target-sha }}
           branches: ${{ needs.PinCommitSHA.outputs.action-branch }}
 
