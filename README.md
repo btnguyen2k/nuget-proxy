@@ -1,51 +1,117 @@
-# nuget-proxy
+[![Release](https://img.shields.io/github/release/btnguyen2k/nuget-proxy.svg?style=flat-square)](RELEASE-NOTES.md)
+[![Actions Status](https://github.com/btnguyen2k/nuget-proxy/actions/workflows/ci.yaml/badge.svg)](https://github.com/btnguyen2k/nuget-proxy/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE.md)
 
 A lightweight, read-only NuGet.org subset feed, implemented in Go. Serve only
-approved package IDs and prefixes through one shared instance, with an on-demand
-disk cache.
+approved package IDs and prefixes, with an on-demand disk cache.
+Supports **NuGet V3** restores with modern .NET tooling; publishing, NuGet V2,
+package search, and Visual Studio package browsing are not supported.
 
 ## Quick start
 
-Requires Go 1.26 or newer. From PowerShell:
+The following examples use POSIX shell syntax (`sh`/`bash`). Both approaches expose the feed at
+`http://localhost:8080/v3/index.json`.
 
-```powershell
-# Edit config.yaml to define the packages available in your feed.
-# For local-only access outside Docker, set listen to "127.0.0.1:8080".
-go run .\cmd\nuget-proxy -config .\config.yaml
+### Build and run from source
+
+Requires Go 1.26 or newer:
+
+```sh
+git clone https://github.com/btnguyen2k/nuget-proxy.git
+cd nuget-proxy
+export NUGET_PROXY_LISTEN="127.0.0.1:8080"
+export NUGET_PROXY_ALLOW="Newtonsoft.Json,Ddth.*"
+go build -o ./nuget-proxy ./cmd/nuget-proxy
+./nuget-proxy -config ./config.yaml
 ```
 
-The source URL is `http://localhost:8080/v3/index.json`. To build a binary:
+### Run the pre-built Docker image
 
-```powershell
-go build -o .\nuget-proxy.exe .\cmd\nuget-proxy
-.\nuget-proxy.exe -config .\config.yaml
+No Go toolchain or local configuration file is required:
+
+```sh
+docker run --rm -p 8080:8080 \
+  --env "NUGET_PROXY_ALLOW=Newtonsoft.Json,Ddth.*" \
+  --env "NUGET_PROXY_PUBLIC_BASE_URL=http://localhost:8080" \
+  --mount "type=volume,source=nuget-proxy-cache,target=/data" \
+  btnguyen2k/nuget-proxy:latest
 ```
 
-In a consuming project's `nuget.config`, configure the proxy as the only package
-source. HTTP is for local development only; the insecure-connection opt-in below
-must be removed when using HTTPS:
+The image includes `config.yaml`; environment variables override its settings.
+The volume preserves cached packages between container runs.
+
+## Use with .NET projects
+
+Choose project-local configuration or user-wide source registration. The local
+HTTP examples below use .NET SDK 9 or newer. For shared deployments, use an HTTPS
+feed URL and omit the insecure-connection options.
+
+### Project-local nuget.config
+
+Place `nuget.config` in your solution/repository root, or beside the `.csproj`
+when restoring that project directly:
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
 <configuration>
   <packageSources>
     <clear />
-    <add key="subset" value="http://localhost:8080/v3/index.json"
+    <add key="nuget-proxy" value="http://localhost:8080/v3/index.json"
          allowInsecureConnections="true" />
   </packageSources>
   <auditSources>
     <clear />
-    <add key="subset" value="http://localhost:8080/v3/index.json"
+    <add key="nuget-proxy" value="http://localhost:8080/v3/index.json"
          allowInsecureConnections="true" />
   </auditSources>
 </configuration>
 ```
 
-Use current .NET tooling; the real-client integration tests require .NET SDK 8
-or newer. Search, Visual Studio browsing, legacy NuGet V2 clients, publishing,
-and registration-based metadata operations are not implemented.
+Then run `dotnet restore` from that directory. `<clear />` removes inherited
+sources so packages and vulnerability audits use the proxy.
 
-## Subset rules
+### Register a source globally with the .NET CLI
+
+On Linux/macOS, explicitly target your user-level NuGet configuration to make the
+source available across projects:
+
+```sh
+dotnet nuget add source "http://localhost:8080/v3/index.json" \
+  --name nuget-proxy --allow-insecure-connections \
+  --configfile "$HOME/.nuget/NuGet/NuGet.Config"
+dotnet restore
+```
+
+Project-local settings can override user-wide settings. Adding the source does
+**not** disable existing sources: disable/remove other package feeds if the
+proxy must enforce the subset. Packages already in NuGet's local cache may be
+reused without contacting the proxy.
+
+## Configuration
+
+Use [`config.yaml`](config.yaml) for native runs. The Docker image includes the
+same file at `/config/config.yaml`; optionally replace it with a read-only bind
+mount. Settings are documented inline, and every setting has an environment
+override:
+
+| Setting | Purpose and included value | Environment variable |
+| --- | --- | --- |
+| `listen` | HTTP bind address; `0.0.0.0:8080`. Use `127.0.0.1:8080` for local-only native access. | `NUGET_PROXY_LISTEN` |
+| `public_base_url` | Client-facing base URL; `http://localhost:8080`. May include a path prefix, but not `/v3/index.json`. | `NUGET_PROXY_PUBLIC_BASE_URL` |
+| `allow` | Available package IDs/prefixes; `[]` exposes no packages. | `NUGET_PROXY_ALLOW` |
+| `cache.dir` | Writable cache directory; `.cache`, relative to the working directory (`/data/.cache` in Docker). | `NUGET_PROXY_CACHE_DIR` |
+| `cache.max_bytes` | Total cache-file budget; `1073741824` bytes (1 GiB). | `NUGET_PROXY_CACHE_MAX_BYTES` |
+| `cache.max_object_bytes` | Largest downloadable object; `134217728` bytes (128 MiB). | `NUGET_PROXY_CACHE_MAX_OBJECT_BYTES` |
+| `cache.metadata_ttl` | Metadata refresh interval; `5m`. | `NUGET_PROXY_CACHE_METADATA_TTL` |
+| `upstream.timeout` | Per-fetch deadline, including concurrency waits and download; `2m`. | `NUGET_PROXY_UPSTREAM_TIMEOUT` |
+| `upstream.max_concurrent` | Maximum simultaneous upstream requests, including downloads; `8`. | `NUGET_PROXY_UPSTREAM_MAX_CONCURRENT` |
+
+Byte counts are positive base-10 integers, without suffixes such as `MiB`.
+`cache.max_bytes` must exceed `cache.max_object_bytes` by at least 64 KiB.
+Durations use Go syntax, such as `30s`, `5m`, or `2h`, and must be positive.
+Configuration changes require a restart; invalid settings fail startup.
+
+### Subset rules
 
 ```yaml
 allow:
@@ -53,215 +119,57 @@ allow:
   - Ddth.*
 ```
 
-- Matching is case-insensitive. Any matching rule makes the ID available.
-- An ID without `*` is exact: `Newtonsoft.Json` does not include
-  `Newtonsoft.Json.Extra`.
-- A single terminal `*` is a literal prefix match: `Ddth.*` includes
-  `Ddth.Core` and `Ddth.Core.Extensions`, not `Ddth` or `DdthExtra`.
-  Other terminal prefixes, such as `Example*`, are also supported.
-- Empty or omitted `allow` exposes no packages. A standalone `*`, regexes,
-  and non-terminal wildcards are rejected.
-- All upstream versions of a matching ID are available, including prereleases.
-  There are no version-specific rules.
-- Dependencies need their own matching rules; allowing a parent never
-  automatically approves its transitive dependencies. Manifests and dependency
-  declarations are not modified.
-- A prefix restricts package names, not publisher identity.
+- Matching is case-insensitive; any matching rule makes an ID available.
+- Exact IDs match only that package. A terminal `*` matches a literal prefix:
+  `Ddth.*` includes `Ddth.Core`, not `Ddth` or `DdthExtra`.
+- An empty or omitted list exposes no packages. Standalone `*`, regexes, and
+  non-terminal wildcards are rejected.
+- Matching an ID allows all its versions, including prereleases. Dependencies
+  must independently match a rule; allowing a parent does not approve them.
 
-Excluded IDs return the same `404 Not Found` response as allowed IDs missing
-upstream, for version lists, manifests, and downloads. **Subset exclusions never
-return `403`.** Rules run before both cache and upstream access, including for
-previously cached packages.
-
-Configuration changes, including environment overrides, require a restart.
-Unknown YAML fields, malformed rules, invalid URLs/limits, and multiple YAML
-documents fail startup explicitly.
-
-## Architecture and protocol
-
-```text
-NuGet client -> request validation -> subset matching -> disk cache -> NuGet.org
-                                       |
-                                     no match
-                                       |
-                                      404
-```
-
-The generated `/v3/index.json` advertises only implemented resources, with URLs
-under the configured `public_base_url`:
-
-| Resource | Behavior |
-| --- | --- |
-| `PackageBaseAddress/3.0.0` | Version lists, `.nuspec`, and byte-for-byte `.nupkg` downloads. |
-| `VulnerabilityInfo/6.7.0` | Proxied index and pages; page URLs are rewritten to this feed. Audit data is not filtered by the package allowlist. |
-| `RepositorySignatures/5.0.0` | Proxied signing metadata and certificates; certificate URLs are rewritten. Advertised only with an HTTPS public URL. |
-
-Optional resources are advertised only when discovered in NuGet.org's service
-index. All endpoints support `GET` and `HEAD`; other methods return `405`.
-Package responses support conditional requests and byte ranges. Unknown routes,
-malformed package paths, and invalid auxiliary-resource links return `404`.
-
-The upstream is fixed to NuGet.org, with resources discovered from its service
-index. Upstream URLs and redirects must use HTTPS on NuGet.org domains; incoming
-credentials, arbitrary destination URLs, and unimplemented upstream resources
-are not forwarded. Resource links use authenticated URL tokens, backed by a
-small persistent key, so clients cannot turn auxiliary routes into an open proxy.
-Previously issued links remain usable across restarts.
-
-Upstream missing packages return `404`; upstream rate limits and temporary
-unavailability retain `429`/`503` and valid `Retry-After` headers. Other upstream
-failures return `502`, timeouts return `504`, local storage failures return `500`,
-and a cache fully occupied by active requests returns `503`. Failures are not
-converted into empty successful feeds.
-
-## Configuration and cache
-
-[`config.yaml`](config.yaml) is the single configuration file for native runs
-and Docker, with each setting documented inline. The provided allowlist is empty;
-configure approved IDs or prefixes before consuming packages. It binds all
-interfaces for Docker; use `127.0.0.1:8080` for local-only native access.
+Packages outside the subset are **unavailable (`404`), not forbidden (`403`)**,
+including packages previously cached by the proxy. Prefixes restrict names,
+not publisher identity.
 
 ### Environment overrides
 
-Every setting can be overridden at startup with a `NUGET_PROXY_*` environment
-variable. Precedence is **built-in defaults < YAML < environment**, with
-validation applied to the merged configuration. The YAML file must still exist
-and parse successfully; environment overrides can supply otherwise missing
-required settings, but do not hide malformed YAML or unknown fields.
+Precedence is **built-in defaults < YAML < environment**. Unset variables preserve
+YAML/default values; explicitly set variables override them, even when empty.
+Invalid overrides fail startup with an error naming the variable. The YAML file
+must still exist and parse successfully.
 
-| Configuration setting | Environment variable | Format |
-| --- | --- | --- |
-| `listen` | `NUGET_PROXY_LISTEN` | Address and port, such as `0.0.0.0:8080` |
-| `public_base_url` | `NUGET_PROXY_PUBLIC_BASE_URL` | Absolute HTTP(S) URL |
-| `allow` | `NUGET_PROXY_ALLOW` | Comma-separated IDs or prefixes |
-| `cache.dir` | `NUGET_PROXY_CACHE_DIR` | Directory path |
-| `cache.max_bytes` | `NUGET_PROXY_CACHE_MAX_BYTES` | Base-10 byte count |
-| `cache.max_object_bytes` | `NUGET_PROXY_CACHE_MAX_OBJECT_BYTES` | Base-10 byte count |
-| `cache.metadata_ttl` | `NUGET_PROXY_CACHE_METADATA_TTL` | Go duration, such as `5m` |
-| `upstream.timeout` | `NUGET_PROXY_UPSTREAM_TIMEOUT` | Go duration, such as `2m` |
-| `upstream.max_concurrent` | `NUGET_PROXY_UPSTREAM_MAX_CONCURRENT` | Positive base-10 integer |
+`NUGET_PROXY_ALLOW="Newtonsoft.Json,Ddth.*"` **replaces** the YAML allowlist with
+comma-separated patterns, trimming surrounding whitespace. An explicitly empty
+value clears the list; whitespace-only values and empty entries such as `Ddth.*,`
+are invalid. Do not use JSON/YAML array syntax.
 
-Unset variables preserve the YAML/default values. Set variables override them
-even when empty; invalid overrides stop startup with an error naming the
-corresponding variable. Size and duration limits retain their normal validation
-rules; byte counts do not accept suffixes such as `MiB`.
+For example, set overrides before starting the binary, or pass them through
+Docker's `--env` option as shown in Quick start:
 
-`NUGET_PROXY_ALLOW` **replaces**, rather than appends to, the YAML allowlist.
-Whitespace around comma-separated patterns is trimmed. An explicitly empty value
-clears the list, making all packages unavailable; whitespace-only values and
-empty entries such as `Ddth.*,` are invalid. The value is not a JSON/YAML array.
-
-```powershell
-$env:NUGET_PROXY_PUBLIC_BASE_URL = "http://localhost:8080"
-$env:NUGET_PROXY_ALLOW = "Newtonsoft.Json,Ddth.*"
-$env:NUGET_PROXY_CACHE_METADATA_TTL = "10m"
-go run .\cmd\nuget-proxy -config .\config.yaml
+```sh
+export NUGET_PROXY_CACHE_MAX_BYTES="2147483648"
+export NUGET_PROXY_CACHE_METADATA_TTL="10m"
 ```
 
-To return to the YAML value, unset the variable, for example with
-`Remove-Item Env:\NUGET_PROXY_ALLOW` in PowerShell.
-
-### Disk cache
-
-Downloads stream to temporary files, then become visible only after a complete
-transfer. **The first response waits for the object to be fully cached** before
-streaming it to the client; large packages are never buffered entirely in memory.
-Concurrent requests for the same object share one upstream fetch. Disconnecting
-one waiting client does not cancel downloads needed by other clients.
-
-Versioned packages, manifests, and certificates remain cached until eviction.
-Mutable metadata is revalidated with upstream ETags or modification dates.
-Expired metadata is not silently served when revalidation fails. Eviction uses
-least-recently-used, unpinned entries; active downloads reserve capacity so
-concurrent misses cannot exceed the configured cache-file budget. Filesystem
-overhead and the 32-byte `url-signing.key` are outside that budget.
-
-Cache entries survive restarts. Incomplete or malformed cache files are removed
-with explicit recovery handling. Keep `url-signing.key` when clearing package
-cache files if old audit/certificate links must remain valid. **Only one process
-may own a cache directory**; shared storage and multi-instance operation are not
-supported.
-
-This is not an offline mirror. Eviction, uncached dependencies, metadata expiry,
-and upstream failures can prevent restores. Immutable cached content is not
-periodically checked for upstream takedowns.
+To return to a YAML value, unset the variable, for example with
+`unset NUGET_PROXY_ALLOW`.
 
 ## Deployment and operations
 
-Run one binary or container behind an ingress/reverse proxy that provides TLS
-and any required access control. Set `public_base_url` to its external HTTPS URL;
-URLs are never derived from untrusted `Host` or forwarded headers. The Go listener
-itself serves HTTP; the ingress must preserve any configured path prefix.
-Repository-signature resources require HTTPS and are omitted
-from local HTTP feeds; package bytes are unchanged in either mode.
+- For shared use, run behind a reverse proxy providing HTTPS and access control.
+  Set `public_base_url` to the external URL and preserve any configured path prefix.
+- Persist `/data` in Docker. Bind-mounted cache directories must be writable by
+  UID 65532. Use one proxy process per cache directory; the cache is not an offline mirror.
+- `/healthz` reports liveness; `/readyz` checks cache writability and usable feed
+  discovery. JSON logs go to stderr, and termination triggers graceful shutdown.
 
-- `/healthz` checks process liveness without upstream access.
-- `/readyz` checks cache-directory writability and usable service discovery.
-  Fresh cached discovery can satisfy this check without upstream access.
-- JSON logs go to stderr and include request status/duration, unavailable-package
-  decisions, recovery warnings, and errors.
-- Interrupt/termination signals initiate graceful shutdown with a 30-second
-  deadline.
+## License
 
-The image includes [`config.yaml`](config.yaml) at
-`/config/config.yaml`, so no configuration mount is required to start it.
-The included configuration listens on `0.0.0.0:8080` and advertises
-`http://localhost:8080`. The container's working directory is `/data`, so the
-relative cache directory `.cache` resolves to `/data/.cache`, inside the
-persistent volume. To reuse an existing cache stored directly in `/data`,
-retain `cache.dir: "/data"`.
+This project is licensed under the MIT License. See the [LICENSE.md](LICENSE.md) file for details.
 
-No cache data is generated during the build. The final `scratch` stage creates
-`/config` when copying the configuration and `/data` with `WORKDIR`, after
-selecting UID/GID 65532. This uses BuildKit's working-directory ownership handling
-without requiring a shell or copying an empty directory from the build stage.
+## Support and Contribution
 
-```powershell
-docker build -t nuget-proxy .
-docker run --rm -p 8080:8080 `
-  --env "NUGET_PROXY_ALLOW=Newtonsoft.Json,Ddth.*" `
-  --env "NUGET_PROXY_PUBLIC_BASE_URL=http://localhost:8080" `
-  --mount "type=volume,source=nuget-proxy-cache,target=/data" `
-  nuget-proxy
-```
+Feel free to create [pull requests](https://github.com/btnguyen2k/nuget-proxy/pulls) or [issues](https://github.com/btnguyen2k/nuget-proxy/issues) to report bugs or suggest new features.
+Please search the existing issues before filing new ones to avoid duplicates. For new issues, file your bug or feature request as a new issue.
 
-The `--env` flags override the included configuration without rebuilding or
-mounting a file. Set `NUGET_PROXY_PUBLIC_BASE_URL` to your externally reachable
-URL for shared deployments. Alternatively, edit `config.yaml` before building
-or override it with a read-only bind mount. Environment variables take precedence
-over a mounted configuration too. The image runs as a non-root user; bind-mounted
-cache directories must be writable by UID 65532.
-
-```powershell
-docker run --rm -p 8080:8080 `
-  --mount "type=bind,source=$((Get-Item .\config.yaml).FullName),target=/config/config.yaml,readonly" `
-  --mount "type=volume,source=nuget-proxy-cache,target=/data" `
-  nuget-proxy
-```
-
-The proxy governs only requests reaching it. To enforce a subset in CI, remove
-other sources, restrict direct package-feed egress, and use isolated client
-package/HTTP caches. NuGet can reuse packages already in its global-packages
-folder without contacting this feed; changing a rule cannot revoke those copies.
-Package-signature validation may also require the client's normal certificate
-trust/revocation infrastructure.
-
-## Development
-
-```powershell
-go test .\...
-go vet .\...
-
-# Real dotnet restore, using generated packages and a local upstream fixture:
-$env:NUGET_PROXY_DOTNET_TEST = "1"
-go test .\internal\proxy -run TestDotnetRestore -count=1
-Remove-Item Env:\NUGET_PROXY_DOTNET_TEST
-```
-
-The integration test isolates NuGet caches and covers approved packages,
-transitive dependencies, warm-cache restores, auditing, and unavailable packages
-without requiring NuGet.org connectivity.
-
-Protocol references: [package content](https://learn.microsoft.com/en-us/nuget/api/package-base-address-resource),
-[vulnerability data](https://learn.microsoft.com/en-us/nuget/api/vulnerability-info),
-[repository signatures](https://learn.microsoft.com/en-us/nuget/api/repository-signatures-resource).
+If you find this project useful, please star it.
