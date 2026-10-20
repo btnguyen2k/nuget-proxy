@@ -15,10 +15,10 @@ on:
     outputs:
       result:
         description: Release preview result
-        value: ${{ jobs.ci.outputs.result }}
+        value: ${{ jobs.BuildAndTest.outputs.result }}
       release-version:
         description: Planned release version
-        value: ${{ jobs.ci.outputs.release-version }}
+        value: ${{ jobs.BuildAndTest.outputs.release-version }}
 
 permissions:
   contents: read
@@ -79,3 +79,32 @@ jobs:
           dry-run: true
           target-sha: ${{ needs.PinCommitSHA.outputs.action-target-sha }}
           branches: ${{ needs.PinCommitSHA.outputs.action-branch }}
+
+  BuildAndTestDocker:
+    needs: PinCommitSHA
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.PinCommitSHA.outputs.target-sha }}
+      - name: Build Docker image
+        run: |
+          docker build --platform "${{ matrix.platform }}" --tag nuget-proxy:ci .
+          test "$(docker image inspect nuget-proxy:ci --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
+      - name: Smoke test Docker image
+        shell: bash
+        run: |
+          container_id="$(docker run --detach --publish 127.0.0.1:8080:8080 nuget-proxy:ci)"
+          trap 'docker logs "$container_id"; docker rm --force --volumes "$container_id"' EXIT
+          curl --fail --silent --show-error \
+            --retry 15 --retry-delay 1 --retry-connrefused --retry-max-time 30 \
+            --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8080/healthz
