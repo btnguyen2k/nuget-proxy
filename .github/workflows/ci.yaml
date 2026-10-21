@@ -87,7 +87,7 @@ jobs:
           branches: ${{ needs.PinCommitSHA.outputs.action-branch }}
 
   BuildAndTestDocker:
-    needs: PinCommitSHA
+    needs: [ PinCommitSHA, BuildAndTest ]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
