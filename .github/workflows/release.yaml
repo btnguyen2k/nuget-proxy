@@ -67,6 +67,7 @@ jobs:
             const { data: mergedCommit } = await github.rest.git.getCommit({
               owner,
               repo,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
               commit_sha: pullRequest.merge_commit_sha
             });
 
@@ -74,6 +75,7 @@ jobs:
               const { data: previousCommit } = await github.rest.git.getCommit({
                 owner,
                 repo,
+                headers: { 'X-GitHub-Api-Version': '2026-03-10' },
                 commit_sha: mergedCommit.parents[0].sha
               });
 
@@ -87,6 +89,7 @@ jobs:
             await github.rest.actions.createWorkflowDispatch({
               owner,
               repo,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
               workflow_id: 'release.yaml',
               ref: pullRequest.base.ref
             });
@@ -406,6 +409,7 @@ jobs:
               const response = await github.rest.repos.getReleaseByTag({
                 owner,
                 repo,
+                headers: { 'X-GitHub-Api-Version': '2026-03-10' },
                 tag
               });
               existingRelease = response.data;
@@ -419,6 +423,7 @@ jobs:
               await github.rest.repos.updateRelease({
                 owner,
                 repo,
+                headers: { 'X-GitHub-Api-Version': '2026-03-10' },
                 release_id: existingRelease.id,
                 tag_name: tag,
                 target_commitish: process.env.RELEASE_COMMIT,
@@ -433,6 +438,7 @@ jobs:
               await github.rest.repos.createRelease({
                 owner,
                 repo,
+                headers: { 'X-GitHub-Api-Version': '2026-03-10' },
                 tag_name: tag,
                 target_commitish: process.env.RELEASE_COMMIT,
                 name: tag,
@@ -626,14 +632,6 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
-      
-      - name: Build Docker image
-        run: |
-          docker build --tag nuget-proxy:release .
-      - name: Push Docker image
-        run: |
-          docker tag nuget-proxy:release my-docker-repo/nuget-proxy:release
-          docker push my-docker-repo/nuget-proxy:release
 
   PublishDockerImageMerge:
     runs-on: ubuntu-latest
@@ -698,6 +696,7 @@ jobs:
             const { data: headRef } = await github.rest.git.getRef({
               owner,
               repo,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
               ref: `heads/${head}`
             });
 
@@ -711,6 +710,7 @@ jobs:
               await github.rest.repos.compareCommitsWithBasehead({
                 owner,
                 repo,
+                headers: { 'X-GitHub-Api-Version': '2026-03-10' },
                 basehead: `${base}...${head}`
               });
 
@@ -723,6 +723,7 @@ jobs:
               await github.rest.pulls.list({
                 owner,
                 repo,
+                headers: { 'X-GitHub-Api-Version': '2026-03-10' },
                 state: 'open',
                 head: `${owner}:${head}`,
                 base,
@@ -744,6 +745,7 @@ jobs:
               await github.rest.pulls.create({
                 owner,
                 repo,
+                headers: { 'X-GitHub-Api-Version': '2026-03-10' },
                 title: `Merge published version ${process.env.VERSION} to main`,
                 body: process.env.RELEASE_NOTES,
                 head,
@@ -863,6 +865,7 @@ jobs:
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
               workflow_id: 'release.yaml', // NOTE: UPDATE IF THE WORKFLOW FILE NAME CHANGES!
               ref: context.payload.repository.default_branch
             });
