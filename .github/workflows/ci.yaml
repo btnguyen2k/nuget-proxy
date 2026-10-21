@@ -12,13 +12,6 @@ on:
         required: false
         type: string
         default: ''
-    outputs:
-      result:
-        description: Release preview result
-        value: ${{ jobs.BuildAndTest.outputs.result }}
-      release-version:
-        description: Planned release version
-        value: ${{ jobs.BuildAndTest.outputs.release-version }}
 
 permissions:
   contents: read
@@ -62,9 +55,6 @@ jobs:
   BuildAndTest:
     needs: PinCommitSHA
     runs-on: ubuntu-latest
-    outputs:
-      result: ${{ steps.plan.outputs.result }}
-      release-version: ${{ steps.plan.outputs.releaseVersion }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -74,7 +64,18 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go test ./...
-      # Read-only plan: SUCCESS permits publication; SKIPPED means no release is needed.
+
+  PreviewRelease:
+    needs: PinCommitSHA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.PinCommitSHA.outputs.target-sha }}
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
       - name: Preview release
         id: plan
         uses: btnguyen2k/action-semrelease@9a1f9152815b6ae99468911fb885c4d65942d29c # v5.0.0
