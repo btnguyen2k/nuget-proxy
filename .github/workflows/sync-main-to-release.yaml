@@ -1,0 +1,87 @@
+# Open a reviewable back-sync PR only after a published release reaches main.
+name: 'sync-main-to-release'
+
+on:
+  pull_request:
+    types: [ closed ]
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  BRANCH_TO_RELEASE: 'release' # Keep synchronized with release.yaml.
+
+jobs:
+  SyncRelease:
+    # Keep the prefix synchronized with env.SYNC_BRANCH_PREFIX in release.yaml.
+    if: |
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-sync/')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: sync-main-to-release-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Create main-to-release PR if needed
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const head = context.payload.pull_request.base.ref;
+            const base = process.env.BRANCH_TO_RELEASE;
+
+            const { data: comparison } =
+              await github.rest.repos.compareCommitsWithBasehead({
+                owner,
+                repo,
+                basehead: `${base}...${head}`
+              });
+
+            if (comparison.ahead_by === 0) {
+              console.log(`ℹ️${base} already contains ${head}.`);
+              return;
+            }
+
+            const { data: existingPulls } =
+              await github.rest.pulls.list({
+                owner,
+                repo,
+                state: 'open',
+                head: `${owner}:${head}`,
+                base,
+                per_page: 100
+              });
+
+            if (existingPulls.length > 0) {
+              console.log(`ℹ️Using existing back-sync PR: ${existingPulls[0].html_url}`);
+              return;
+            }
+
+            const { data: pullRequest } =
+              await github.rest.pulls.create({
+                owner,
+                repo,
+                title: `Sync ${head} back into ${base}`,
+                body: [
+                  `Sync ${head} back into ${base} after ${context.payload.pull_request.html_url} merged.`,
+                  '',
+                  '**Merge this PR with a merge commit, not squash or rebase, to preserve branch history.**',
+                  '',
+                  `Resolve conflicts without discarding newer work or release instructions on ${base}.`,
+                  'This workflow does not merge the PR or reset either branch.',
+                  '',
+                  'History-only merges do not start another release. Content changes queue a normal release check.'
+                ].join('\n'),
+                head,
+                base,
+                maintainer_can_modify: false
+              });
+
+            console.log(`✅Created back-sync PR: ${pullRequest.html_url}`);

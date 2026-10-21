@@ -9,7 +9,23 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.pull_request.merged) && format('release-{0}-{1}', github.repository, github.event.pull_request.base.ref || 'release') || format('release-skip-{0}', github.run_id) }}
+  # Classify back-syncs outside the release queue so a no-op cannot displace
+  # queued release work. Content changes dispatch a normal serialized run.
+  group: >-
+    ${{
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.pull_request.merged &&
+          !(
+            github.event.pull_request.head.ref == 'main' &&
+            github.event.pull_request.head.repo.full_name == github.repository
+          )
+        )
+      ) &&
+      format('release-{0}-{1}', github.repository, github.event.pull_request.base.ref || 'release') ||
+      format('release-skip-{0}', github.run_id)
+    }}
   cancel-in-progress: false
 
 permissions:
@@ -24,10 +40,69 @@ env:
   DOCKER_IMAGE: btnguyen2k/nuget-proxy # update your Docker Hub image name here
 
 jobs:
+  CheckBackSync:
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check whether back-sync changed release content
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullRequest = context.payload.pull_request;
+
+            if (!pullRequest.merge_commit_sha) {
+              throw new Error('The merged back-sync PR has no merge commit SHA.');
+            }
+
+            const { data: mergedCommit } = await github.rest.git.getCommit({
+              owner,
+              repo,
+              commit_sha: pullRequest.merge_commit_sha
+            });
+
+            if (mergedCommit.parents.length === 2) {
+              const { data: previousCommit } = await github.rest.git.getCommit({
+                owner,
+                repo,
+                commit_sha: mergedCommit.parents[0].sha
+              });
+
+              if (mergedCommit.tree.sha === previousCommit.tree.sha) {
+                console.log('ℹ️History-only back-sync; no release check is needed.');
+                return;
+              }
+            }
+
+            // For squash/rebase, conservatively run the normal release planner.
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: 'release.yaml',
+              ref: pullRequest.base.ref
+            });
+
+            console.log('✅Queued a normal release check after the back-sync.');
+
   ResolveReleaseSource:
     if: |
       (github.event_name == 'workflow_dispatch') ||
-      (github.event.pull_request.merged == true)
+      (
+        github.event.pull_request.merged == true &&
+        !(
+          github.event.pull_request.head.ref == 'main' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      )
     runs-on: ubuntu-latest
     outputs:
       MODE: ${{ steps.resolve.outputs.mode }}
