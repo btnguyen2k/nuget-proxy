@@ -1,0 +1,6 @@
+.git
+.github
+.cache
+*.exe
+*.test
+coverage.*

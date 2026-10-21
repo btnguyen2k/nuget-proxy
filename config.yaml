@@ -1,0 +1,59 @@
+# Shared configuration for native runs and Docker.
+# Docker includes this file at /config/config.yaml. Restart after changing it.
+# Precedence: built-in defaults < this file < NUGET_PROXY_* environment variables.
+# Unset variables preserve YAML values. Empty values are validated, not ignored;
+# an empty NUGET_PROXY_ALLOW explicitly clears the allowlist.
+# Durations use Go syntax, such as 30s, 5m, or 2h, and must be positive.
+
+# Bind all interfaces so Docker's published port can reach the service.
+# For local-only native access, use "127.0.0.1:8080" (the default when omitted).
+# Environment: NUGET_PROXY_LISTEN
+listen: "0.0.0.0:8080"
+
+# Required: the externally reachable base URL, optionally including a path prefix.
+# Do not append /v3/index.json. Use HTTPS behind a TLS-terminating ingress for
+# shared deployments; HTTP is for local development and omits signing discovery.
+# Environment: NUGET_PROXY_PUBLIC_BASE_URL
+public_base_url: "http://localhost:8080"
+
+# Case-insensitive package IDs or literal prefixes ending in a single *.
+# For example: allow: ["Newtonsoft.Json", "Ddth.*"]
+# An empty list exposes no packages; excluded IDs return 404, not 403.
+# Matching an ID allows all its versions. Dependencies need their own matches.
+# Regexes, non-terminal wildcards, and a standalone * are not supported.
+# Environment: NUGET_PROXY_ALLOW="Newtonsoft.Json,Ddth.*" replaces this list.
+# Spaces around comma-separated patterns are trimmed; empty patterns are invalid.
+allow: []
+
+cache:
+  # Dedicated writable directory, owned by only one proxy process.
+  # Relative to the process working directory, not this configuration file:
+  # native runs use .cache under that directory; Docker uses /data/.cache.
+  # Environment: NUGET_PROXY_CACHE_DIR
+  dir: ".cache"
+
+  # Logical cache-file budget in bytes, including metadata and active downloads.
+  # Filesystem overhead and the small URL-signing key are outside this budget.
+  # Environment: NUGET_PROXY_CACHE_MAX_BYTES (base-10 integer)
+  max_bytes: 1073741824 # 1 GiB
+
+  # Maximum downloaded object size in bytes, including packages and audit pages.
+  # Must be positive; max_bytes must leave at least 64 KiB extra for metadata.
+  # Environment: NUGET_PROXY_CACHE_MAX_OBJECT_BYTES (base-10 integer)
+  max_object_bytes: 134217728 # 128 MiB
+
+  # Revalidation interval for discovery, version lists, audit data, and signing
+  # indexes. Versioned packages, manifests, and certificates persist until evicted.
+  # Environment: NUGET_PROXY_CACHE_METADATA_TTL (Go duration, e.g. 5m)
+  metadata_ttl: 5m
+
+upstream:
+  # Deadline per cache fetch, including concurrency waits and body downloads.
+  # The upstream is fixed to NuGet.org and is not configured here.
+  # Environment: NUGET_PROXY_UPSTREAM_TIMEOUT (Go duration, e.g. 2m)
+  timeout: 2m
+
+  # Positive limit on simultaneous upstream requests, including body downloads.
+  # Requests for the same cached object share one upstream fetch.
+  # Environment: NUGET_PROXY_UPSTREAM_MAX_CONCURRENT (base-10 integer)
+  max_concurrent: 8
