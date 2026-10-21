@@ -1,7 +1,7 @@
 # This file has been cleaned up post-releasing version 0.0.0.
 # Generate its content quickly using the following command:
 #   git log origin..HEAD | grep "^\s" > .semrelease/this_release
-#!VERSION=0.1.0
+#!VERSION=0.0.1
 - feat(proxy): add read-only NuGet V3 package restore support
 - feat(policy): allow case-insensitive package IDs and prefixes with 404 for exclusions
 - feat(cache): add bounded persistent LRU caching with request coalescing
