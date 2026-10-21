@@ -626,14 +626,6 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
-      
-      - name: Build Docker image
-        run: |
-          docker build --tag nuget-proxy:release .
-      - name: Push Docker image
-        run: |
-          docker tag nuget-proxy:release my-docker-repo/nuget-proxy:release
-          docker push my-docker-repo/nuget-proxy:release
 
   PublishDockerImageMerge:
     runs-on: ubuntu-latest
