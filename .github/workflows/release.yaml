@@ -612,12 +612,12 @@ jobs:
           set -euo pipefail
 
           git fetch --no-tags origin \
-            "refs/heads/${BRANCH_TO_RELEASE}:refs/remotes/origin/release-head"
+            "refs/heads/${BRANCH_TO_RELEASE}:refs/release-finalize/release-head"
           git fetch --no-tags origin \
-            "refs/heads/${SYNC_BRANCH}:refs/remotes/origin/release-sync"
+            "refs/heads/${SYNC_BRANCH}:refs/release-finalize/sync-head"
 
-          RELEASE_HEAD=$(git rev-parse refs/remotes/origin/release-head)
-          FETCHED_SYNC=$(git rev-parse refs/remotes/origin/release-sync)
+          RELEASE_HEAD=$(git rev-parse refs/release-finalize/release-head)
+          FETCHED_SYNC=$(git rev-parse refs/release-finalize/sync-head)
 
           if [ "${FETCHED_SYNC}" != "${SYNC_COMMIT}" ]; then
             echo "❌The immutable sync branch moved."
