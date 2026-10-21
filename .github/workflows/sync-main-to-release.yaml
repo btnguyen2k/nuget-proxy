@@ -1,4 +1,5 @@
 # Open a reviewable back-sync PR only after a published release reaches main.
+# Remove the merged sync branch without touching tags or releases.
 name: 'sync-main-to-release'
 
 on:
@@ -85,3 +86,68 @@ jobs:
               });
 
             console.log(`✅Created back-sync PR: ${pullRequest.html_url}`);
+
+  CleanupSyncBranch:
+    # Cleanup must not be coalesced with another release's back-sync PR creation.
+    if: |
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-sync/')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cleanup-release-sync-${{ github.repository }}-${{ github.event.pull_request.head.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Remove merged sync branch if present
+        env:
+          SYNC_BRANCH: ${{ github.event.pull_request.head.ref }}
+          SYNC_COMMIT: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SYNC_REF="refs/heads/${SYNC_BRANCH}"
+
+          if [[ "${SYNC_BRANCH}" != release-sync/* ]] ||
+             [[ ! "${SYNC_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
+             ! git check-ref-format "${SYNC_REF}"; then
+            echo "❌Invalid sync branch or commit."
+            exit 1
+          fi
+
+          remote_sync_sha() {
+            git ls-remote --heads origin "${SYNC_REF}" | awk '{print $1}'
+          }
+
+          REMOTE_SYNC=$(remote_sync_sha)
+
+          if [ -z "${REMOTE_SYNC}" ]; then
+            echo "ℹ️Merged sync branch is already removed."
+            exit 0
+          fi
+
+          if [ "${REMOTE_SYNC}" != "${SYNC_COMMIT}" ]; then
+            echo "❌Sync branch moved to ${REMOTE_SYNC}; refusing to delete it."
+            exit 1
+          fi
+
+          if ! git push \
+               --force-with-lease="${SYNC_REF}:${SYNC_COMMIT}" \
+               origin \
+               ":${SYNC_REF}"; then
+            REMOTE_SYNC=$(remote_sync_sha)
+
+            if [ -z "${REMOTE_SYNC}" ]; then
+              echo "ℹ️Merged sync branch is already removed."
+              exit 0
+            fi
+
+            echo "❌Could not delete sync branch at ${REMOTE_SYNC}."
+            exit 1
+          fi
+
+          echo "✅Removed merged sync branch."

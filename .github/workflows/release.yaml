@@ -764,18 +764,73 @@ jobs:
     permissions:
       actions: write
       contents: write
+      pull-requests: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Resolve immutable sync snapshot
+        id: sync_snapshot
+        env:
+          SYNC_BRANCH: ${{ needs.Release.outputs.SYNC_BRANCH }}
+          SYNC_COMMIT: ${{ needs.Release.outputs.SYNC_COMMIT }}
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const branch = process.env.SYNC_BRANCH;
+            const commit = process.env.SYNC_COMMIT;
+            const { stdout } = await exec.getExecOutput(
+              'git',
+              ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`],
+              { silent: true }
+            );
+            const remoteSha = stdout.trim().split(/\s+/)[0];
+
+            if (remoteSha) {
+              if (remoteSha !== commit) {
+                throw new Error(`The immutable sync branch moved to ${remoteSha}.`);
+              }
+              core.setOutput('fetch_ref', commit);
+              return;
+            }
+
+            // GitHub retains PR head refs after branch deletion, including
+            // squash/rebase merges where the sync commit is not in main.
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+              state: 'closed',
+              head: `${owner}:${branch}`,
+              base: 'main',
+              per_page: 100
+            });
+            const mergedPull = pulls.find(pull =>
+              pull.merged_at &&
+              pull.base.repo.full_name === `${owner}/${repo}` &&
+              pull.base.ref === 'main' &&
+              pull.head.repo?.full_name === `${owner}/${repo}` &&
+              pull.head.ref === branch &&
+              pull.head.sha === commit
+            );
+
+            if (!mergedPull) {
+              throw new Error('Missing sync branch has no matching merged PR to main.');
+            }
+
+            console.log(`ℹ️Sync branch already removed; using merged PR #${mergedPull.number}.`);
+            core.setOutput('fetch_ref', `refs/pull/${mergedPull.number}/head`);
       - name: Detect newer release work
         id: catch_up
         env:
           VERSION: ${{ needs.Release.outputs.VERSION }}
           RELEASE_COMMIT: ${{ needs.Release.outputs.RELEASE_COMMIT }}
-          SYNC_BRANCH: ${{ needs.Release.outputs.SYNC_BRANCH }}
           SYNC_COMMIT: ${{ needs.Release.outputs.SYNC_COMMIT }}
+          SYNC_FETCH_REF: ${{ steps.sync_snapshot.outputs.fetch_ref }}
         shell: bash
         run: |
           set -euo pipefail
@@ -783,7 +838,7 @@ jobs:
           git fetch --no-tags origin \
             "refs/heads/${BRANCH_TO_RELEASE}:refs/release-finalize/release-head"
           git fetch --no-tags origin \
-            "refs/heads/${SYNC_BRANCH}:refs/release-finalize/sync-head"
+            "${SYNC_FETCH_REF}:refs/release-finalize/sync-head"
 
           RELEASE_HEAD=$(git rev-parse refs/release-finalize/release-head)
           FETCHED_SYNC=$(git rev-parse refs/release-finalize/sync-head)
