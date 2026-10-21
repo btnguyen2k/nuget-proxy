@@ -1,0 +1,168 @@
+name: Plan release
+description: Calculate a dry-run release plan or load the immutable plan for a pending release.
+
+inputs:
+  mode:
+    description: Whether to calculate a new plan or resume a pending plan, new or resume.
+    required: true
+  source-sha:
+    description: Full commit SHA returned by resolve-release-source.
+    required: true
+  release-branch:
+    description: Release branch used by the semantic-release calculation.
+    required: true
+  github-token:
+    description: Token with contents read access for checkout and release planning.
+    required: true
+  tag-prefix:
+    description: Prefix for release tags.
+    required: false
+    default: v
+  candidate-ref:
+    description: Full pending branch ref, required in resume mode.
+    required: false
+  candidate-sha:
+    description: Expected pending metadata commit SHA, required in resume mode.
+    required: false
+
+outputs:
+  result:
+    description: Planning result; SUCCESS allows the caller to publish.
+    value: ${{ steps.plan.outputs.result }}
+  version:
+    description: Calculated or previously saved release version.
+    value: ${{ steps.plan.outputs.version }}
+  release_notes:
+    description: Calculated or previously saved multiline release notes.
+    value: ${{ steps.plan.outputs.release_notes }}
+
+runs:
+  using: composite
+  # Checking out an older source may remove this action's files. Keep scripts inline.
+  steps:
+    - name: Validate release plan inputs
+      id: validate
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        RELEASE_BRANCH: ${{ inputs.release-branch }}
+        CANDIDATE_REF: ${{ inputs.candidate-ref }}
+        CANDIDATE_SHA: ${{ inputs.candidate-sha }}
+      run: |
+        set -euo pipefail
+
+        if [ "${MODE}" != "new" ] && [ "${MODE}" != "resume" ]; then
+          echo "❌mode must be new or resume."
+          exit 1
+        fi
+        if [[ ! "${SOURCE_SHA}" =~ ^[[:xdigit:]]{40}$ ]]; then
+          echo "❌source-sha must be a full 40-character commit SHA."
+          exit 1
+        fi
+        if ! git check-ref-format "refs/heads/${RELEASE_BRANCH}"; then
+          echo "❌release-branch must be a valid branch name."
+          exit 1
+        fi
+        if [ "${MODE}" = "resume" ]; then
+          if [[ "${CANDIDATE_REF}" != refs/heads/* ]] ||
+             ! git check-ref-format "${CANDIDATE_REF}"; then
+            echo "❌candidate-ref must be a full branch ref in resume mode."
+            exit 1
+          fi
+          if [[ ! "${CANDIDATE_SHA}" =~ ^[[:xdigit:]]{40}$ ]]; then
+            echo "❌candidate-sha must be a full 40-character commit SHA in resume mode."
+            exit 1
+          fi
+        fi
+    - name: Checkout release source
+      id: checkout_source
+      uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.source-sha }}
+        fetch-depth: 0
+        token: ${{ inputs.github-token }}
+    - name: Install Node
+      id: setup_node
+      if: inputs.mode == 'new'
+      uses: actions/setup-node@v7
+      with:
+        node-version: 'lts/*'
+    - name: Calculate release plan
+      if: inputs.mode == 'new'
+      id: release_dry_run
+      uses: btnguyen2k/action-semrelease@9a1f9152815b6ae99468911fb885c4d65942d29c # v5.0.0
+      with:
+        dry-run: true
+        target-sha: ${{ inputs.source-sha }}
+        github-token: ${{ inputs.github-token }}
+        tag-major-release: false
+        tag-minor-release: false
+        branches: ${{ inputs.release-branch }}
+        tag-prefix: ${{ inputs.tag-prefix }}
+        tag-only: true
+    - name: Load pending release plan
+      if: inputs.mode == 'resume'
+      id: pending_plan
+      env:
+        CANDIDATE_REF: ${{ inputs.candidate-ref }}
+        CANDIDATE_SHA: ${{ inputs.candidate-sha }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        git fetch --no-tags origin \
+          "${CANDIDATE_REF}:refs/remotes/origin/release-candidate"
+
+        FETCHED_CANDIDATE=$(git rev-parse refs/remotes/origin/release-candidate)
+        if [ "${FETCHED_CANDIDATE}" != "${CANDIDATE_SHA}" ]; then
+          echo "❌The pending release candidate changed."
+          exit 1
+        fi
+
+        git show \
+          "${CANDIDATE_SHA}:.semrelease/pending/release-notes.md" \
+          > "${RUNNER_TEMP}/pending-release-notes.md"
+
+        VERSION=$(
+          git show \
+            "${CANDIDATE_SHA}:.semrelease/pending/version" |
+            tr -d '\r\n'
+        )
+
+        echo "result=SUCCESS" >> "$GITHUB_OUTPUT"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+    - name: Normalize release plan
+      id: plan
+      env:
+        MODE: ${{ inputs.mode }}
+        NEW_RESULT: ${{ steps.release_dry_run.outputs.result }}
+        NEW_VERSION: ${{ steps.release_dry_run.outputs.releaseVersion }}
+        NEW_RELEASE_NOTES: ${{ steps.release_dry_run.outputs.releaseNotes }}
+        PENDING_RESULT: ${{ steps.pending_plan.outputs.result }}
+        PENDING_VERSION: ${{ steps.pending_plan.outputs.version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ "${MODE}" = "resume" ]; then
+          RESULT="${PENDING_RESULT}"
+          VERSION="${PENDING_VERSION}"
+          RELEASE_NOTES=$(cat "${RUNNER_TEMP}/pending-release-notes.md")
+        else
+          RESULT="${NEW_RESULT}"
+          VERSION="${NEW_VERSION}"
+          RELEASE_NOTES="${NEW_RELEASE_NOTES}"
+        fi
+
+        DELIMITER="RELEASE_NOTES_$(cat /proc/sys/kernel/random/uuid)"
+        {
+          echo "result=${RESULT}"
+          echo "version=${VERSION}"
+          echo "release_notes<<${DELIMITER}"
+          printf '%s\n' "${RELEASE_NOTES}"
+          echo "${DELIMITER}"
+        } >> "$GITHUB_OUTPUT"
+
+        # do not print full release notes, only its length
+        printf '✅Normalized release plan:\n- result=%s\n- version=%s\n- release_notes_length=%s\n' "$RESULT" "$VERSION" "${#RELEASE_NOTES}"
