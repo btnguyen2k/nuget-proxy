@@ -9,7 +9,23 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.pull_request.merged) && format('release-{0}-{1}', github.repository, github.event.pull_request.base.ref || 'release') || format('release-skip-{0}', github.run_id) }}
+  # Classify back-syncs outside the release queue so a no-op cannot displace
+  # queued release work. Content changes dispatch a normal serialized run.
+  group: >-
+    ${{
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.pull_request.merged &&
+          !(
+            github.event.pull_request.head.ref == 'main' &&
+            github.event.pull_request.head.repo.full_name == github.repository
+          )
+        )
+      ) &&
+      format('release-{0}-{1}', github.repository, github.event.pull_request.base.ref || 'release') ||
+      format('release-skip-{0}', github.run_id)
+    }}
   cancel-in-progress: false
 
 permissions:
@@ -21,12 +37,72 @@ env:
   SYNC_BRANCH_PREFIX: 'release-sync'
   TAG_PREFIX: 'v'
   FILE_CHANGELOG: 'RELEASE-NOTES.md'
+  DOCKER_IMAGE: btnguyen2k/nuget-proxy # update your Docker Hub image name here
 
 jobs:
+  CheckBackSync:
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check whether back-sync changed release content
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullRequest = context.payload.pull_request;
+
+            if (!pullRequest.merge_commit_sha) {
+              throw new Error('The merged back-sync PR has no merge commit SHA.');
+            }
+
+            const { data: mergedCommit } = await github.rest.git.getCommit({
+              owner,
+              repo,
+              commit_sha: pullRequest.merge_commit_sha
+            });
+
+            if (mergedCommit.parents.length === 2) {
+              const { data: previousCommit } = await github.rest.git.getCommit({
+                owner,
+                repo,
+                commit_sha: mergedCommit.parents[0].sha
+              });
+
+              if (mergedCommit.tree.sha === previousCommit.tree.sha) {
+                console.log('ℹ️History-only back-sync; no release check is needed.');
+                return;
+              }
+            }
+
+            // For squash/rebase, conservatively run the normal release planner.
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: 'release.yaml',
+              ref: pullRequest.base.ref
+            });
+
+            console.log('✅Queued a normal release check after the back-sync.');
+
   ResolveReleaseSource:
     if: |
       (github.event_name == 'workflow_dispatch') ||
-      (github.event.pull_request.merged == true)
+      (
+        github.event.pull_request.merged == true &&
+        !(
+          github.event.pull_request.head.ref == 'main' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      )
     runs-on: ubuntu-latest
     outputs:
       MODE: ${{ steps.resolve.outputs.mode }}
@@ -368,14 +444,6 @@ jobs:
 
               console.log(`✅Created GitHub release ${tag}.`);
             }
-      - name: Publish Docker image
-        if: steps.prepare_release.outputs.state == 'ready'
-        env:
-          VERSION: ${{ needs.ReleasePlan.outputs.VERSION }}
-        shell: bash
-        run: |
-          echo "ℹ️Publishing Docker image for version ${VERSION}."
-          # TODO
       - name: Clean consumed release instructions
         if: steps.prepare_release.outputs.state == 'ready'
         env:
@@ -504,6 +572,105 @@ jobs:
           echo "sync_commit=${SYNC_COMMIT}" >> "$GITHUB_OUTPUT"
           printf '✅Published release with sync branch %s and commit %s.\n' "${SYNC_BRANCH}" "${SYNC_COMMIT}"
 
+  PublishDockerImageBuild:
+    name: Build Docker image(s) - Linux
+    runs-on: ubuntu-latest
+    needs: [ ResolveReleaseSource, Release ]
+    if: needs.Release.outputs.PUBLISHED == 'true'
+    strategy:
+      matrix:
+        platforms: [ 'linux/amd64', 'linux/arm64' ] # change target platform list if needed
+    env:
+      VERSION: ${{ needs.Release.outputs.VERSION }}
+    outputs:
+      VERSION: ${{ needs.Release.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.ResolveReleaseSource.outputs.SOURCE_SHA }}
+          fetch-depth: 0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USER }}
+          password: ${{ secrets.DOCKER_HUB_PAT }}
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platforms }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          platforms: ${{ matrix.platforms }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.DOCKER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          file: ./Dockerfile
+          context: ./
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+      
+      - name: Build Docker image
+        run: |
+          docker build --tag nuget-proxy:release .
+      - name: Push Docker image
+        run: |
+          docker tag nuget-proxy:release my-docker-repo/nuget-proxy:release
+          docker push my-docker-repo/nuget-proxy:release
+
+  PublishDockerImageMerge:
+    runs-on: ubuntu-latest
+    needs: [ ResolveReleaseSource, PublishDockerImageBuild ]
+    name: Merge & Publish Docker image(s) - Linux
+    env:
+      VERSION: ${{ needs.PublishDockerImageBuild.outputs.VERSION }}
+    outputs:
+      VERSION: ${{ needs.PublishDockerImageBuild.outputs.VERSION }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USER }}
+          password: ${{ secrets.DOCKER_HUB_PAT }}
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.DOCKER_IMAGE }}:release \
+            -t ${{ env.DOCKER_IMAGE }}:${{ env.VERSION }} \
+            -t ${{ env.DOCKER_IMAGE }}:${{ github.sha }} \
+            $(printf '${{ env.DOCKER_IMAGE }}@sha256:%s ' *)
+
   MergeToMain:
     runs-on: ubuntu-latest
     needs: [ Release ]
@@ -612,12 +779,12 @@ jobs:
           set -euo pipefail
 
           git fetch --no-tags origin \
-            "refs/heads/${BRANCH_TO_RELEASE}:refs/remotes/origin/release-head"
+            "refs/heads/${BRANCH_TO_RELEASE}:refs/release-finalize/release-head"
           git fetch --no-tags origin \
-            "refs/heads/${SYNC_BRANCH}:refs/remotes/origin/release-sync"
+            "refs/heads/${SYNC_BRANCH}:refs/release-finalize/sync-head"
 
-          RELEASE_HEAD=$(git rev-parse refs/remotes/origin/release-head)
-          FETCHED_SYNC=$(git rev-parse refs/remotes/origin/release-sync)
+          RELEASE_HEAD=$(git rev-parse refs/release-finalize/release-head)
+          FETCHED_SYNC=$(git rev-parse refs/release-finalize/sync-head)
 
           if [ "${FETCHED_SYNC}" != "${SYNC_COMMIT}" ]; then
             echo "❌The immutable sync branch moved."
