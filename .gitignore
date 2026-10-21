@@ -28,6 +28,9 @@ go.work.sum
 # env file
 .env
 
+# Cached package content
+.cache/
+
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/

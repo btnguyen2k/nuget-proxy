@@ -1,0 +1,703 @@
+# Automatically release a new version when a PR is merged to branch `release`
+
+name: 'release'
+
+on:
+  pull_request:
+    types: [ closed ]
+    branches: [ release ] # Keep synchronized with env.BRANCH_TO_RELEASE.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.pull_request.merged) && format('release-{0}-{1}', github.repository, github.event.pull_request.base.ref || 'release') || format('release-skip-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BRANCH_TO_RELEASE: 'release'
+  PENDING_BRANCH_PREFIX: 'release-pending'
+  SYNC_BRANCH_PREFIX: 'release-sync'
+  TAG_PREFIX: 'v'
+  FILE_CHANGELOG: 'RELEASE-NOTES.md'
+
+jobs:
+  ResolveReleaseSource:
+    if: |
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+    outputs:
+      MODE: ${{ steps.resolve.outputs.mode }}
+      SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+      CANDIDATE_REF: ${{ steps.resolve.outputs.candidate_ref }}
+      CANDIDATE_SHA: ${{ steps.resolve.outputs.candidate_sha }}
+    steps:
+      - name: Checkout workflow source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+      - name: Resolve release candidate
+        id: resolve
+        uses: ./.github/actions/resolve-release-source
+        with:
+          release-branch: ${{ env.BRANCH_TO_RELEASE }}
+          pending-branch-prefix: ${{ env.PENDING_BRANCH_PREFIX }}
+
+  CallCI:
+    needs: [ ResolveReleaseSource ]
+    uses: ./.github/workflows/ci.yaml
+    with:
+      target-sha: ${{ needs.ResolveReleaseSource.outputs.SOURCE_SHA }}
+    secrets: inherit
+
+  ReleasePlan:
+    runs-on: ubuntu-latest
+    needs: [ ResolveReleaseSource, CallCI ]
+    outputs:
+      RESULT: ${{ steps.plan.outputs.result }}
+      VERSION: ${{ steps.plan.outputs.version }}
+      RELEASE_NOTES: ${{ steps.plan.outputs.release_notes }}
+      SOURCE_SHA: ${{ needs.ResolveReleaseSource.outputs.SOURCE_SHA }}
+      MODE: ${{ needs.ResolveReleaseSource.outputs.MODE }}
+      CANDIDATE_REF: ${{ needs.ResolveReleaseSource.outputs.CANDIDATE_REF }}
+      CANDIDATE_SHA: ${{ needs.ResolveReleaseSource.outputs.CANDIDATE_SHA }}
+    steps:
+      - name: Checkout workflow source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+      - name: Plan release
+        id: plan
+        uses: ./.github/actions/release-plan
+        with:
+          mode: ${{ needs.ResolveReleaseSource.outputs.MODE }}
+          source-sha: ${{ needs.ResolveReleaseSource.outputs.SOURCE_SHA }}
+          release-branch: ${{ env.BRANCH_TO_RELEASE }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          tag-prefix: ${{ env.TAG_PREFIX }}
+          candidate-ref: ${{ needs.ResolveReleaseSource.outputs.CANDIDATE_REF }}
+          candidate-sha: ${{ needs.ResolveReleaseSource.outputs.CANDIDATE_SHA }}
+
+  Release:
+    runs-on: ubuntu-latest
+    needs: [ ResolveReleaseSource, ReleasePlan ]
+    if: needs.ReleasePlan.outputs.RESULT == 'SUCCESS'
+    permissions:
+      contents: write
+    outputs:
+      PUBLISHED: ${{ steps.create_sync_branch.outputs.published }}
+      VERSION: ${{ needs.ReleasePlan.outputs.VERSION }}
+      RELEASE_NOTES: ${{ needs.ReleasePlan.outputs.RELEASE_NOTES }}
+      RELEASE_COMMIT: ${{ steps.prepare_release.outputs.release_commit }}
+      CANDIDATE_REF: ${{ steps.prepare_release.outputs.candidate_ref }}
+      CANDIDATE_SHA: ${{ steps.prepare_release.outputs.candidate_sha }}
+      SYNC_BRANCH: ${{ steps.create_sync_branch.outputs.sync_branch }}
+      SYNC_COMMIT: ${{ steps.create_sync_branch.outputs.sync_commit }}
+    env:
+      SOURCE_SHA: ${{ needs.ReleasePlan.outputs.SOURCE_SHA }}
+      RELEASE_MODE: ${{ needs.ReleasePlan.outputs.MODE }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.ReleasePlan.outputs.SOURCE_SHA }}
+          fetch-depth: 0
+      - name: Prepare resumable release candidate
+        id: prepare_release
+        env:
+          VERSION: ${{ needs.ReleasePlan.outputs.VERSION }}
+          RELEASE_NOTES: ${{ needs.ReleasePlan.outputs.RELEASE_NOTES }}
+          EXISTING_CANDIDATE_REF: ${{ needs.ReleasePlan.outputs.CANDIDATE_REF }}
+          EXISTING_CANDIDATE_SHA: ${{ needs.ReleasePlan.outputs.CANDIDATE_SHA }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config --global user.email "<>"
+          git config --global user.name "CI Build"
+
+          if [ "${RELEASE_MODE}" = "resume" ]; then
+            # verify and pass forward the existing release candidate
+
+            git fetch --no-tags origin \
+              "${EXISTING_CANDIDATE_REF}:refs/remotes/origin/release-candidate"
+
+            CANDIDATE_SHA=$(
+              git rev-parse refs/remotes/origin/release-candidate
+            )
+            if [ "${CANDIDATE_SHA}" != "${EXISTING_CANDIDATE_SHA}" ]; then
+              echo "❌The pending release candidate changed."
+              exit 1
+            fi
+
+            RELEASE_COMMIT=$(git rev-parse "${CANDIDATE_SHA}^")
+            if [ "${RELEASE_COMMIT}" != "${SOURCE_SHA}" ]; then
+              echo "❌The pending release candidate target changed."
+              exit 1
+            fi
+
+            STORED_VERSION=$(
+              git show \
+                "${CANDIDATE_SHA}:.semrelease/pending/version" |
+                tr -d '\r\n'
+            )
+            if [ "${STORED_VERSION}" != "${VERSION}" ]; then
+              echo "❌The pending release version changed."
+              exit 1
+            fi
+
+            CANDIDATE_REF="${EXISTING_CANDIDATE_REF}"
+            echo "ℹ️Resuming pending release candidate ${CANDIDATE_REF}."
+          else
+            # prepare a new release candidate
+            ## 1. Update changelog with the new release information
+            ## 2. Update version info in the relevant files
+
+            RELEASE_DATE=$(git show -s --format=%cs "${SOURCE_SHA}")
+            RELEASE_HEADING="## ${RELEASE_DATE} - v${VERSION}"
+
+            # update changelog with the new release heading and notes (sort newest first)
+            if grep -Fqx -- "${RELEASE_HEADING}" "${FILE_CHANGELOG}"; then
+              echo "ℹ️${FILE_CHANGELOG} already contains ${RELEASE_HEADING}."
+            else
+              head -1 "${FILE_CHANGELOG}" > .temp.md
+              {
+                printf '\n%s\n\n' "${RELEASE_HEADING}"
+                printf '%s\n' "${RELEASE_NOTES}"
+              } >> .temp.md
+              tail -n +2 "${FILE_CHANGELOG}" >> .temp.md
+              mv -f .temp.md "${FILE_CHANGELOG}"
+            fi
+
+            # update version placeholders in markdown files
+            sed -i -E "s/<<VERSION>>/v${VERSION}/g" ./*.md
+            git add -u
+
+            # update version placeholders in source code (.go) files in current directory and all subdirectories
+            find . -name '*.go' -type f -exec sed -i -E "s/<<VERSION>>/v${VERSION}/g" {} +
+            git add -u
+
+            git fetch --no-tags origin "refs/heads/${BRANCH_TO_RELEASE}"
+            REMOTE_SHA=$(git rev-parse FETCH_HEAD)
+
+            if [ "${REMOTE_SHA}" != "${SOURCE_SHA}" ]; then
+              echo "⚠️The release branch advanced to ${REMOTE_SHA}. A queued workflow will calculate a release from the newer head."
+              echo "state=stale" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if git diff --cached --quiet; then
+              RELEASE_COMMIT="${SOURCE_SHA}"
+            else
+              git commit -m "Release ${TAG_PREFIX}${VERSION}"
+              RELEASE_COMMIT=$(git rev-parse HEAD)
+
+              if ! git push origin \
+                   "HEAD:refs/heads/${BRANCH_TO_RELEASE}"; then
+                git fetch --no-tags origin \
+                  "refs/heads/${BRANCH_TO_RELEASE}"
+                CURRENT_REMOTE=$(git rev-parse FETCH_HEAD)
+
+                if ! git merge-base --is-ancestor \
+                     "${RELEASE_COMMIT}" "${CURRENT_REMOTE}"; then
+                  echo "⚠️The release branch changed before the release commit was pushed. A queued workflow will use the newer head."
+                  echo "state=stale" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+
+                echo "⚠️The release commit was pushed before the branch advanced."
+              fi
+            fi
+
+            CANDIDATE_REF="refs/heads/${PENDING_BRANCH_PREFIX}/${TAG_PREFIX}${VERSION}"
+
+            if git ls-remote --exit-code --heads origin \
+                 "${CANDIDATE_REF}" >/dev/null 2>&1; then
+              echo "❌Candidate ref ${CANDIDATE_REF} already exists unexpectedly."
+              exit 1
+            fi
+
+            git checkout --detach "${RELEASE_COMMIT}"
+            if [ -e .semrelease/pending ]; then
+              echo "❌.semrelease/pending already exists in the release tree."
+              exit 1
+            fi
+
+            mkdir -p .semrelease/pending
+            # This commit exists only on the temporary candidate ref. It makes
+            # retries independent from later changes on the release branch.
+            printf '%s\n' "${VERSION}" \
+              > .semrelease/pending/version
+            printf '%s' "${RELEASE_NOTES}" \
+              > .semrelease/pending/release-notes.md
+            printf '%s\n' "${RELEASE_COMMIT}" \
+              > .semrelease/pending/target-sha
+
+            git add .semrelease/pending
+            git commit -m "Record pending release ${TAG_PREFIX}${VERSION}"
+            CANDIDATE_SHA=$(git rev-parse HEAD)
+
+            if ! git push origin \
+                 "${CANDIDATE_SHA}:${CANDIDATE_REF}"; then
+              REMOTE_CANDIDATE=$(
+                git ls-remote --heads origin "${CANDIDATE_REF}" |
+                  awk '{print $1}'
+              )
+
+              if [ "${REMOTE_CANDIDATE}" != "${CANDIDATE_SHA}" ]; then
+                echo "❌Unable to create pending release candidate ${CANDIDATE_REF}."
+                exit 1
+              fi
+            fi
+
+            git reset --hard "${RELEASE_COMMIT}"
+          fi
+
+          RELEASE_INPUT_BLOB=$(
+            git rev-parse \
+              "${RELEASE_COMMIT}:.semrelease/this_release"
+          )
+
+          echo "state=ready" >> "$GITHUB_OUTPUT"
+          echo "release_commit=${RELEASE_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "release_input_blob=${RELEASE_INPUT_BLOB}" >> "$GITHUB_OUTPUT"
+          echo "candidate_ref=${CANDIDATE_REF}" >> "$GITHUB_OUTPUT"
+          echo "candidate_sha=${CANDIDATE_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Report stale release plan
+        if: steps.prepare_release.outputs.state == 'stale'
+        shell: bash
+        run: |
+          echo "⚠️The release plan became stale before publication. No package, tag, or release was published by this run."
+      - name: Ensure immutable release tag
+        if: steps.prepare_release.outputs.state == 'ready'
+        env:
+          VERSION: ${{ needs.ReleasePlan.outputs.VERSION }}
+          RELEASE_COMMIT: ${{ steps.prepare_release.outputs.release_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${TAG_PREFIX}${VERSION}"
+
+          if git ls-remote --exit-code --refs origin \
+               "refs/tags/${TAG}" >/dev/null 2>&1; then
+            git fetch --force origin \
+              "refs/tags/${TAG}:refs/tags/${TAG}"
+
+            EXISTING_COMMIT=$(git rev-list -n 1 "${TAG}")
+
+            if [ "${EXISTING_COMMIT}" != "${RELEASE_COMMIT}" ]; then
+              echo "❌Tag ${TAG} points to ${EXISTING_COMMIT}, not ${RELEASE_COMMIT}."
+              exit 1
+            fi
+          else
+            git tag -a "${TAG}" "${RELEASE_COMMIT}" -m "Release ${TAG}"
+
+            if ! git push origin "refs/tags/${TAG}"; then
+              git fetch --force origin \
+                "refs/tags/${TAG}:refs/tags/${TAG}"
+              EXISTING_COMMIT=$(git rev-list -n 1 "${TAG}")
+
+              if [ "${EXISTING_COMMIT}" != "${RELEASE_COMMIT}" ]; then
+                echo "❌Tag ${TAG} was concurrently created at ${EXISTING_COMMIT}."
+                exit 1
+              fi
+            fi
+          fi
+      - name: Publish GitHub release
+        if: steps.prepare_release.outputs.state == 'ready'
+        uses: actions/github-script@v9
+        env:
+          VERSION: ${{ needs.ReleasePlan.outputs.VERSION }}
+          RELEASE_NOTES: ${{ needs.ReleasePlan.outputs.RELEASE_NOTES }}
+          RELEASE_COMMIT: ${{ steps.prepare_release.outputs.release_commit }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const version = process.env.VERSION;
+            const tag = `${process.env.TAG_PREFIX}${version}`;
+            const body = process.env.RELEASE_NOTES ?? '';
+            const prerelease = version.includes('-');
+
+            let existingRelease;
+            try {
+              const response = await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag
+              });
+              existingRelease = response.data;
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+
+            if (existingRelease) {
+              await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: existingRelease.id,
+                tag_name: tag,
+                target_commitish: process.env.RELEASE_COMMIT,
+                name: tag,
+                body,
+                draft: false,
+                prerelease
+              });
+
+              console.log(`ℹ️Updated existing GitHub release ${tag}.`);
+            } else {
+              await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                target_commitish: process.env.RELEASE_COMMIT,
+                name: tag,
+                body,
+                draft: false,
+                prerelease,
+                generate_release_notes: false
+              });
+
+              console.log(`✅Created GitHub release ${tag}.`);
+            }
+      - name: Publish Docker image
+        if: steps.prepare_release.outputs.state == 'ready'
+        env:
+          VERSION: ${{ needs.ReleasePlan.outputs.VERSION }}
+        shell: bash
+        run: |
+          echo "ℹ️Publishing Docker image for version ${VERSION}."
+          # TODO
+      - name: Clean consumed release instructions
+        if: steps.prepare_release.outputs.state == 'ready'
+        env:
+          VERSION: ${{ needs.ReleasePlan.outputs.VERSION }}
+          EXPECTED_INPUT_BLOB: ${{ steps.prepare_release.outputs.release_input_blob }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLEANED_MARKER="# This file has been cleaned up post-releasing version ${VERSION}."
+
+          # Clean only the exact input consumed by this release. If a newer PR
+          # changed the file, its instructions belong to the next release.
+          for ATTEMPT in $(seq 1 10); do
+            git fetch --no-tags origin "refs/heads/${BRANCH_TO_RELEASE}"
+            REMOTE_SHA=$(git rev-parse FETCH_HEAD)
+            CURRENT_BLOB=$(
+              git rev-parse \
+                "${REMOTE_SHA}:.semrelease/this_release" \
+                2>/dev/null ||
+                true
+            )
+
+            git show \
+              "${REMOTE_SHA}:.semrelease/this_release" \
+              > "${RUNNER_TEMP}/current-this-release"
+
+            if grep -Fqx -- \
+                 "${CLEANED_MARKER}" \
+                 "${RUNNER_TEMP}/current-this-release"; then
+              echo "ℹ️Release instructions are already clean."
+              exit 0
+            fi
+
+            if [ "${CURRENT_BLOB}" != "${EXPECTED_INPUT_BLOB}" ]; then
+              echo "⚠️Release instructions changed after this release was planned. They are preserved for the next queued release."
+              exit 0
+            fi
+
+            git checkout --detach "${REMOTE_SHA}"
+            {
+              printf '# This file has been cleaned up post-releasing version %s.\n' \
+                "${VERSION}"
+              printf '%s\n' '# Generate its content quickly using the following command:'
+              printf '%s\n' '#   git log origin..HEAD | grep "^\s" > .semrelease/this_release'
+            } > .semrelease/this_release
+
+            git add .semrelease/this_release
+            if git diff --cached --quiet; then
+              echo "ℹ️Release instructions are already clean."
+              exit 0
+            fi
+
+            git commit -m "Clean release instructions after ${TAG_PREFIX}${VERSION}"
+
+            if git push origin \
+                 "HEAD:refs/heads/${BRANCH_TO_RELEASE}"; then
+              echo "ℹ️Cleaned consumed release instructions."
+              exit 0
+            fi
+
+            echo "⚠️The release branch moved during cleanup attempt ${ATTEMPT}."
+          done
+
+          echo "❌Unable to clean consumed release instructions after 10 attempts."
+          exit 1
+      - name: Create immutable main-sync branch
+        if: steps.prepare_release.outputs.state == 'ready'
+        id: create_sync_branch
+        env:
+          VERSION: ${{ needs.ReleasePlan.outputs.VERSION }}
+          RELEASE_COMMIT: ${{ steps.prepare_release.outputs.release_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git checkout --detach "${RELEASE_COMMIT}"
+          # The PR uses a fixed per-version branch so later release-branch
+          # commits cannot enter the already-created PR.
+          {
+            printf '# This file has been cleaned up post-releasing version %s.\n' \
+              "${VERSION}"
+            printf '%s\n' '# Generate its content quickly using the following command:'
+            printf '%s\n' '#   git log origin..HEAD | grep "^\s" > .semrelease/this_release'
+          } > .semrelease/this_release
+
+          git add .semrelease/this_release
+          if git diff --cached --quiet; then
+            SYNC_COMMIT="${RELEASE_COMMIT}"
+          else
+            COMMIT_DATE=$(git show -s --format=%cI "${RELEASE_COMMIT}")
+            GIT_AUTHOR_DATE="${COMMIT_DATE}" \
+            GIT_COMMITTER_DATE="${COMMIT_DATE}" \
+              git commit -m "Clean release instructions after ${TAG_PREFIX}${VERSION}"
+            SYNC_COMMIT=$(git rev-parse HEAD)
+          fi
+
+          SYNC_BRANCH="${SYNC_BRANCH_PREFIX}/${TAG_PREFIX}${VERSION}"
+          SYNC_REF="refs/heads/${SYNC_BRANCH}"
+          REMOTE_SYNC=$(
+            git ls-remote --heads origin "${SYNC_REF}" |
+              awk '{print $1}'
+          )
+
+          if [ -n "${REMOTE_SYNC}" ]; then
+            if [ "${REMOTE_SYNC}" != "${SYNC_COMMIT}" ]; then
+              echo "❌Sync branch ${SYNC_BRANCH} already points to ${REMOTE_SYNC}."
+              exit 1
+            fi
+          else
+            if ! git push origin "${SYNC_COMMIT}:${SYNC_REF}"; then
+              REMOTE_SYNC=$(
+                git ls-remote --heads origin "${SYNC_REF}" |
+                  awk '{print $1}'
+              )
+
+              if [ "${REMOTE_SYNC}" != "${SYNC_COMMIT}" ]; then
+                echo "❌Unable to create immutable sync branch ${SYNC_BRANCH}."
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "published=true" >> "$GITHUB_OUTPUT"
+          echo "sync_branch=${SYNC_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "sync_commit=${SYNC_COMMIT}" >> "$GITHUB_OUTPUT"
+          printf '✅Published release with sync branch %s and commit %s.\n' "${SYNC_BRANCH}" "${SYNC_COMMIT}"
+
+  MergeToMain:
+    runs-on: ubuntu-latest
+    needs: [ Release ]
+    if: needs.Release.outputs.PUBLISHED == 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Create merge-to-main PR if needed
+        uses: actions/github-script@v9
+        env:
+          VERSION: ${{ needs.Release.outputs.VERSION }}
+          RELEASE_NOTES: ${{ needs.Release.outputs.RELEASE_NOTES }}
+          SYNC_BRANCH: ${{ needs.Release.outputs.SYNC_BRANCH }}
+          SYNC_COMMIT: ${{ needs.Release.outputs.SYNC_COMMIT }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const head = process.env.SYNC_BRANCH;
+            const expectedHead = process.env.SYNC_COMMIT;
+            const base = 'main';
+
+            const { data: headRef } = await github.rest.git.getRef({
+              owner,
+              repo,
+              ref: `heads/${head}`
+            });
+
+            if (headRef.object.sha !== expectedHead) {
+              throw new Error(
+                `Sync branch ${head} moved from ${expectedHead} to ${headRef.object.sha}.`
+              );
+            }
+
+            const { data: comparison } =
+              await github.rest.repos.compareCommitsWithBasehead({
+                owner,
+                repo,
+                basehead: `${base}...${head}`
+              });
+
+            if (comparison.ahead_by === 0) {
+              console.log(`ℹ️${base} already contains ${head}.`);
+              return;
+            }
+
+            const { data: existingPulls } =
+              await github.rest.pulls.list({
+                owner,
+                repo,
+                state: 'open',
+                head: `${owner}:${head}`,
+                base,
+                per_page: 100
+              });
+
+            if (existingPulls.length > 0) {
+              if (existingPulls[0].head.sha !== expectedHead) {
+                throw new Error(
+                  `Existing sync PR head moved to ${existingPulls[0].head.sha}.`
+                );
+              }
+
+              console.log(`ℹ️Using existing merge PR: ${existingPulls[0].html_url}`);
+              return;
+            }
+
+            const { data: pullRequest } =
+              await github.rest.pulls.create({
+                owner,
+                repo,
+                title: `Merge published version ${process.env.VERSION} to main`,
+                body: process.env.RELEASE_NOTES,
+                head,
+                base,
+                maintainer_can_modify: false
+              });
+
+            console.log(`✅Created merge PR: ${pullRequest.html_url}`);
+
+  FinalizeRelease:
+    runs-on: ubuntu-latest
+    needs: [ Release, MergeToMain ]
+    if: |
+      (needs.Release.outputs.PUBLISHED == 'true') &&
+      (needs.MergeToMain.result == 'success')
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect newer release work
+        id: catch_up
+        env:
+          VERSION: ${{ needs.Release.outputs.VERSION }}
+          RELEASE_COMMIT: ${{ needs.Release.outputs.RELEASE_COMMIT }}
+          SYNC_BRANCH: ${{ needs.Release.outputs.SYNC_BRANCH }}
+          SYNC_COMMIT: ${{ needs.Release.outputs.SYNC_COMMIT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin \
+            "refs/heads/${BRANCH_TO_RELEASE}:refs/remotes/origin/release-head"
+          git fetch --no-tags origin \
+            "refs/heads/${SYNC_BRANCH}:refs/remotes/origin/release-sync"
+
+          RELEASE_HEAD=$(git rev-parse refs/remotes/origin/release-head)
+          FETCHED_SYNC=$(git rev-parse refs/remotes/origin/release-sync)
+
+          if [ "${FETCHED_SYNC}" != "${SYNC_COMMIT}" ]; then
+            echo "❌The immutable sync branch moved."
+            exit 1
+          fi
+
+          if [ "${RELEASE_HEAD}" = "${RELEASE_COMMIT}" ]; then
+            echo "required=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge-base --is-ancestor \
+               "${RELEASE_COMMIT}" "${RELEASE_HEAD}"; then
+            echo "❌The release branch no longer contains ${RELEASE_COMMIT}."
+            exit 1
+          fi
+
+          COMMIT_COUNT=$(
+            git rev-list --count "${RELEASE_COMMIT}..${RELEASE_HEAD}"
+          )
+
+          if [ "${COMMIT_COUNT}" -eq 1 ]; then
+            ONLY_COMMIT=$(
+              git rev-list -n 1 "${RELEASE_COMMIT}..${RELEASE_HEAD}"
+            )
+            SUBJECT=$(git show -s --format=%s "${ONLY_COMMIT}")
+            RELEASE_TREE=$(git rev-parse "${RELEASE_HEAD}^{tree}")
+            SYNC_TREE=$(git rev-parse "${SYNC_COMMIT}^{tree}")
+
+            if [ "${SUBJECT}" = \
+                 "Clean release instructions after ${TAG_PREFIX}${VERSION}" ] &&
+               [ "${RELEASE_TREE}" = "${SYNC_TREE}" ]; then
+              echo "required=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "required=true" >> "$GITHUB_OUTPUT"
+      - name: Remove completed pending candidate
+        env:
+          CANDIDATE_REF: ${{ needs.Release.outputs.CANDIDATE_REF }}
+          CANDIDATE_SHA: ${{ needs.Release.outputs.CANDIDATE_SHA }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REMOTE_CANDIDATE=$(
+            git ls-remote --heads origin "${CANDIDATE_REF}" |
+              awk '{print $1}'
+          )
+
+          if [ -z "${REMOTE_CANDIDATE}" ]; then
+            echo "ℹ️Pending release candidate is already removed."
+            exit 0
+          fi
+
+          if [ "${REMOTE_CANDIDATE}" != "${CANDIDATE_SHA}" ]; then
+            echo "❌Pending release candidate moved to ${REMOTE_CANDIDATE}."
+            exit 1
+          fi
+
+          git push \
+            --force-with-lease="${CANDIDATE_REF}:${CANDIDATE_SHA}" \
+            origin \
+            ":${CANDIDATE_REF}"
+
+          echo "✅Removed completed pending release candidate."
+      - name: Queue a catch-up release check
+        if: steps.catch_up.outputs.required == 'true'
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // A run that resumed an older candidate may have consumed the
+            // newest queued PR event. Recheck the latest release-branch head.
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'release.yaml', // NOTE: UPDATE IF THE WORKFLOW FILE NAME CHANGES!
+              ref: context.payload.repository.default_branch
+            });
+
+            console.log('✅Queued a catch-up release check.');

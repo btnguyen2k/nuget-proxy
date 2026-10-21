@@ -1,0 +1,116 @@
+name: 'ci'
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    types: [opened, edited, reopened, synchronize, review_requested]
+  workflow_call:
+    inputs:
+      target-sha:
+        description: Pinned commit SHA to test; defaults to the workflow context SHA
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  VERSION_PREFIX: v
+
+jobs:
+  # Check out the event SHA (synthetic merge on PRs), or an explicit target-sha.
+  # Standalone PR previews use base history/metadata, not the proposed PR changes.
+  # A caller's full 40-character SHA overrides both checkout and preview targets.
+  PinCommitSHA:
+    runs-on: ubuntu-latest
+    outputs:
+      target-sha: ${{ steps.capture.outputs.target-sha }}
+      action-target-sha: ${{ steps.capture.outputs.action-target-sha }}
+      action-branch: ${{ steps.capture.outputs.action-branch }}
+    steps:
+      - name: Capture pinned commit SHA
+        id: capture
+        shell: bash
+        env:
+          TARGET_SHA: ${{ inputs.target-sha || github.sha }}
+          PR_BASE_SHA: ${{ !inputs.target-sha && github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+          ACTION_BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          if [[ ! "$TARGET_SHA" =~ ^[[:xdigit:]]{40}$ ]]; then
+            echo "❌target-sha must be a full 40-character commit SHA"
+            exit 1
+          fi
+          ACTION_TARGET_SHA="${PR_BASE_SHA:-$TARGET_SHA}"
+          if [[ ! "$ACTION_TARGET_SHA" =~ ^[[:xdigit:]]{40}$ ]]; then
+            echo "❌Action target must be a full 40-character commit SHA"
+            exit 1
+          fi
+          printf 'target-sha=%s\n' "$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          printf 'action-target-sha=%s\n' "$ACTION_TARGET_SHA" >> "$GITHUB_OUTPUT"
+          printf 'action-branch=%s\n' "$ACTION_BRANCH" >> "$GITHUB_OUTPUT"
+          printf '✅Successfully captured pinned commit SHA:\n- target-sha=%s\n- action-target-sha=%s\n- action-branch=%s\n' "$TARGET_SHA" "$ACTION_TARGET_SHA" "$ACTION_BRANCH"
+
+  BuildAndTest:
+    needs: PinCommitSHA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.PinCommitSHA.outputs.target-sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go test ./...
+
+  PreviewRelease:
+    needs: PinCommitSHA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.PinCommitSHA.outputs.target-sha }}
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+      - name: Preview release
+        id: plan
+        uses: btnguyen2k/action-semrelease@9a1f9152815b6ae99468911fb885c4d65942d29c # v5.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: true
+          tag-prefix: ${{ env.VERSION_PREFIX }}
+          target-sha: ${{ needs.PinCommitSHA.outputs.action-target-sha }}
+          branches: ${{ needs.PinCommitSHA.outputs.action-branch }}
+
+  BuildAndTestDocker:
+    needs: [ PinCommitSHA, BuildAndTest ]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.PinCommitSHA.outputs.target-sha }}
+      - name: Build Docker image
+        run: |
+          docker build --platform "${{ matrix.platform }}" --tag nuget-proxy:ci .
+          test "$(docker image inspect nuget-proxy:ci --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
+      - name: Smoke test Docker image
+        shell: bash
+        run: |
+          container_id="$(docker run --detach --publish 127.0.0.1:8080:8080 nuget-proxy:ci)"
+          trap 'docker logs "$container_id"; docker rm --force --volumes "$container_id"' EXIT
+          curl --fail --silent --show-error \
+            --retry 15 --retry-delay 1 --retry-connrefused --retry-max-time 30 \
+            --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8080/healthz

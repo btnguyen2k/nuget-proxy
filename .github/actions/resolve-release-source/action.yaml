@@ -1,0 +1,36 @@
+name: Resolve release source
+description: Resolve the release branch head or resume an immutable pending release candidate.
+
+inputs:
+  release-branch:
+    description: Branch whose commits are released.
+    required: true
+  pending-branch-prefix:
+    description: Literal branch prefix containing pending release candidates, without a trailing slash.
+    required: true
+
+outputs:
+  mode:
+    description: new when no pending candidate exists, otherwise resume.
+    value: ${{ steps.resolve.outputs.mode }}
+  source_sha:
+    description: Code commit to test and release, excluding pending-release metadata.
+    value: ${{ steps.resolve.outputs.source_sha }}
+  candidate_ref:
+    description: Full pending branch ref, or empty for a new release.
+    value: ${{ steps.resolve.outputs.candidate_ref }}
+  candidate_sha:
+    description: Pending metadata commit SHA, or empty for a new release.
+    value: ${{ steps.resolve.outputs.candidate_sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve release candidate
+      id: resolve
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BRANCH_TO_RELEASE: ${{ inputs.release-branch }}
+        PENDING_BRANCH_PREFIX: ${{ inputs.pending-branch-prefix }}
+      run: bash "${ACTION_PATH}/resolve.sh"
