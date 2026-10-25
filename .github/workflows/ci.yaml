@@ -80,7 +80,7 @@ jobs:
           node-version: 'lts/*'
       - name: Preview release
         id: plan
-        uses: btnguyen2k/action-semrelease@9a1f9152815b6ae99468911fb885c4d65942d29c # v5.0.0
+        uses: btnguyen2k/action-semrelease@37fe196d36496098bd291e9519c86772ea2e0c0d # v5.1.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           dry-run: true
